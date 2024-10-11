@@ -11,11 +11,11 @@ import csv
 import xlsxwriter
 
 # 读取数据文件
-data_50 = pd.read_csv("D:/文件/全球校园人工智能算法精英挑战赛/code/dataset/data_50.csv", header=None)
-distance_50 = pd.read_csv("D:/文件/全球校园人工智能算法精英挑战赛/code/dataset/distance_50.csv", header=None)
-roads_50 = pd.read_csv("D:/文件/全球校园人工智能算法精英挑战赛/code/dataset/roads_50.csv", header=None)
-speed_50 = pd.read_csv("D:/文件/全球校园人工智能算法精英挑战赛/code/dataset/speed_50.csv", header=None)
-EVs_50 = pd.read_csv("D:/文件/全球校园人工智能算法精英挑战赛/code/dataset/EVs_50.csv", header=None)
+data_50 = pd.read_csv("./dataset/data_50.csv", header=None)
+distance_50 = pd.read_csv("./dataset/distance_50.csv", header=None)
+roads_50 = pd.read_csv("./dataset/roads_50.csv", header=None)
+speed_50 = pd.read_csv("./dataset/speed_50.csv", header=None)
+EVs_50 = pd.read_csv("./dataset/EVs_50.csv", header=None)
 
 # 将数据转换为numpy数组
 distance_matrix = distance_50.values
@@ -25,10 +25,10 @@ charge_matrix = roads_50.values
 bus_stations_coords = data_50[[0,1]].values
 
 # 提取电动汽车相关参数
-start_longitudes = EVs_50[0].values
-start_latitudes = EVs_50[1].values
-end_longitudes = EVs_50[2].values
-end_latitudes = EVs_50[3].values
+start_latitudes = EVs_50[0].values
+start_longitudes = EVs_50[1].values
+end_latitudes = EVs_50[2].values
+end_longitudes = EVs_50[3].values
 initial_energy = EVs_50[4].values
 battery_capacity = EVs_50[5].values
 deadlines = EVs_50[6].values
@@ -69,6 +69,7 @@ class EVDispatchEnvironment:
             distances = [geodesic(coord, station_coord).km for station_coord in self.bus_stations_coords]
             nearest_station = np.argmin(distances)
             nearest_stations.append(nearest_station)
+        # print("Nearest stations:", nearest_stations)
         return nearest_stations
 
     def get_state(self):
@@ -76,6 +77,7 @@ class EVDispatchEnvironment:
         state = []
         for i in range(self.n_cars):
             state.extend([self.current_energy[i], self.time_remaining[i], self.current_positions[i]])
+
         return np.array(state, dtype=np.float32)
 
     def step(self, actions):
@@ -87,10 +89,10 @@ class EVDispatchEnvironment:
                 distance = self.distance_matrix[current_pos, next_pos]
                 speed = self.speed_matrix[current_pos, next_pos]
 
-                # 检查速度和距离是否为0
+                # 检查速度和距离是否为0，避免无效路径
                 if speed <= 0 or distance <= 0:
                     print(f"Warning: Invalid speed or distance for car {car} at step {action}")
-                    rewards.append(0)
+                    rewards.append(-100)  # 给无效动作一个较大的负奖励
                     self.done[car] = True
                     continue
 
@@ -102,6 +104,7 @@ class EVDispatchEnvironment:
                 # 检查电池容量是否有效
                 if np.isnan(self.battery_capacity[car]):
                     print(f"Warning: Invalid battery capacity for car {car}")
+                    rewards.append(-100)  # 对无效电池容量的情况给出负奖励
                     self.done[car] = True
                     continue
 
@@ -110,24 +113,36 @@ class EVDispatchEnvironment:
                 if np.isnan(new_energy) or np.isnan(energy_used) or np.isnan(energy_received):
                     print(
                         f"Warning: Invalid energy calculation for car {car}. Energy used: {energy_used}, Energy received: {energy_received}")
+                    rewards.append(-100)  # 对无效能量计算给出负奖励
                     self.done[car] = True
                     continue
 
                 # 限制最大电量为电池容量
                 self.current_energy[car] = min(new_energy, self.battery_capacity[car])
-                self.time_remaining[car] -= time_taken
+
+                # 更新剩余时间，确保时间为非负数
+                self.time_remaining[car] = self.time_remaining[car] - time_taken
 
                 # 检查是否到达终点
                 end_station = self.get_nearest_stations([self.end_coords[car]])[0]
                 if self.current_positions[car] == end_station:
+                    # 根据到达终点时的剩余时间给予奖励
+                    reward = self.current_energy[car] + (self.time_remaining[car] * 10)  # 奖励根据剩余能量和时间
+                    rewards.append(reward)
                     self.done[car] = True
+                else:
+                    # 如果超时但未到达终点，给予负奖励
+                    if self.time_remaining[car] <= 0:
+                        rewards.append(-500)  # 超时未完成，给予较大的负奖励
+                        self.done[car] = True
+                    else:
+                        # 正常更新时的奖励为剩余电量
+                        rewards.append(self.current_energy[car])
 
                 # 如果电量耗尽或超出截止时间，则任务失败
                 if self.current_energy[car] <= 0 or self.time_remaining[car] <= 0:
+                    rewards.append(-500)  # 电量耗尽或时间超时的惩罚
                     self.done[car] = True
-
-                # 奖励为当前剩余电量
-                rewards.append(self.current_energy[car])
             else:
                 rewards.append(0)
 
@@ -135,14 +150,15 @@ class EVDispatchEnvironment:
         return next_state, rewards, self.done
 
     def get_total_remaining_energy(self):
-        # 计算所有车辆的剩余电量总和
-        return sum([self.current_energy[i] if self.done[i] else 0 for i in range(self.n_cars)])
+        # 计算所有到达终点的车辆的剩余电量总和
+        return sum([self.current_energy[i] for i in range(self.n_cars) if self.done[i]])
 
 
 class DQNAgent:
-    def __init__(self, state_size, action_size):
+    def __init__(self, state_size, action_size, n_cars):
         self.state_size = state_size  # 状态空间维度
         self.action_size = action_size  # 动作空间维度
+        self.n_cars = n_cars  # 车辆数量
         self.memory = deque(maxlen=5000)
         self.gamma = 0.95    # 折扣率
         self.epsilon = 1.0   # 探索率
@@ -162,43 +178,64 @@ class DQNAgent:
             nn.ReLU(),
             nn.Linear(128, 128),
             nn.ReLU(),
-            nn.Linear(128, self.action_size)
+            nn.Linear(128, self.action_size * self.n_cars),
+            nn.Unflatten(1, (self.n_cars, self.action_size))
         )
 
     def remember(self, state, action, reward, next_state, done):
+        # # 确保 reward 是一个标量
+        reward = np.array(reward).mean()  # 可以取平均值或其他方式
+        # 存储经验
         self.memory.append((state, action, reward, next_state, done))
 
     def act(self, state):
-        state = torch.FloatTensor(state).to(self.device)
+        state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        # print("state:",state.size())
         if np.random.rand() <= self.epsilon:
             # 随机选择动作
             return np.random.randint(0, self.action_size, size=(env.n_cars,))
         with torch.no_grad():
             q_values = self.model(state)
-        actions = q_values.argmax(dim=1).cpu().numpy()
-        return actions
+        # print("q_values:",q_values.size())
+        # print("q_values:",q_values)
+        actions = q_values.argmax(dim=2).cpu().numpy()
+        # print("actions:",actions.shape)
+        return actions.squeeze(0)
 
     def replay(self, batch_size):
         if len(self.memory) < batch_size:
             return
         minibatch = random.sample(self.memory, batch_size)
 
-        for state, action, reward, next_state, done in minibatch:
-            state = torch.FloatTensor(state).to(self.device)
-            next_state = torch.FloatTensor(next_state).to(self.device)
-            reward = torch.FloatTensor(reward).to(self.device)
-            action = torch.LongTensor(action).to(self.device)
-            done = torch.BoolTensor(done).to(self.device)
+        # 解压 minibatch
+        states, actions, rewards, next_states, dones = zip(*minibatch)
 
-            target = self.model(state).gather(1, action.unsqueeze(1)).squeeze(1)
-            next_q = self.model(next_state).max(1)[0]
-            expected = reward + (1 - done.float()) * self.gamma * next_q
+        # 将它们转换为 NumPy 数组，再转换为张量
+        states = torch.FloatTensor(np.array(states)).to(self.device)
+        next_states = torch.FloatTensor(np.array(next_states)).to(self.device)
+        rewards = torch.FloatTensor(np.array(rewards)).to(self.device)
 
-            loss = self.criterion(target, expected.detach())
+        actions = torch.LongTensor(actions).to(self.device)
+        dones = torch.FloatTensor(np.array(dones)).to(self.device)
 
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
+        # 模型预测Q值
+        outputs = self.model(states)  # 形状为 [batch_size, n_cars, action_size]
+
+        # 计算下一个状态的最大 Q 值
+        next_q = self.model(next_states).max(2)[0]  # 形状为 [batch_size, n_cars]
+
+        # 计算目标值
+        expected = rewards.unsqueeze(1) + (1 - dones.unsqueeze(1)) * self.gamma * next_q  # 形状为 [batch_size, n_cars]
+
+        # 选择当前动作对应的Q值
+        actions_indices = actions.unsqueeze(2)  # 形状为 [batch_size, n_cars, 1]
+        targets = outputs.gather(2, actions_indices).squeeze(2)  # 形状为 [batch_size, n_cars]
+
+        loss = self.criterion(targets, expected.detach())
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
 
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
@@ -215,9 +252,10 @@ env = EVDispatchEnvironment(distance_matrix, speed_matrix, charge_matrix,
 
 state_size = env.n_cars * 3  # 每辆车的状态：当前能量、剩余时间、当前位置
 action_size = env.n_stations  # 动作空间为所有公交站点
+n_cars=len(initial_energy)
 
-agent = DQNAgent(state_size, action_size)
-episodes = 1000
+agent = DQNAgent(state_size, action_size, n_cars)
+episodes = 200
 batch_size = 64
 rewards_history = []
 
@@ -225,7 +263,9 @@ for e in range(episodes):
     state = env.reset()
     total_reward = 0
     for time_step in range(500):  # 每个episode的最大步数
+        # print(state.shape)
         actions = agent.act(state)
+        # print(actions.shape)
         next_state, rewards, done = env.step(actions)
         total_reward += sum(rewards)
         agent.remember(state, actions, rewards, next_state, done)
