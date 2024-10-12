@@ -91,8 +91,7 @@ class EVDispatchEnvironment:
 
                 # 检查速度和距离是否为0，避免无效路径
                 if speed <= 0 or distance <= 0:
-                    print(f"Warning: Invalid speed or distance for car {car} at step {action}")
-                    rewards.append(-100)  # 给无效动作一个较大的负奖励
+                    rewards.append(-10)  # 给予小的负奖励，避免无效路径
                     self.done[car] = True
                     continue
 
@@ -101,57 +100,35 @@ class EVDispatchEnvironment:
                 energy_used = (distance / 100) * self.energy_consumption[car]  # 基于能耗计算
                 energy_received = charge * 100 * (time_taken)  # MPT充电功率为100kW
 
-                # 检查电池容量是否有效
-                if np.isnan(self.battery_capacity[car]):
-                    print(f"Warning: Invalid battery capacity for car {car}")
-                    rewards.append(-100)  # 对无效电池容量的情况给出负奖励
-                    self.done[car] = True
-                    continue
-
                 # 更新电量并确保不超过电池容量
                 new_energy = self.current_energy[car] - energy_used + energy_received
-                if np.isnan(new_energy) or np.isnan(energy_used) or np.isnan(energy_received):
-                    print(
-                        f"Warning: Invalid energy calculation for car {car}. Energy used: {energy_used}, Energy received: {energy_received}")
-                    rewards.append(-100)  # 对无效能量计算给出负奖励
-                    self.done[car] = True
-                    continue
-
-                # 限制最大电量为电池容量
                 self.current_energy[car] = min(new_energy, self.battery_capacity[car])
 
-                # 更新剩余时间，确保时间为非负数
-                self.time_remaining[car] = self.time_remaining[car] - time_taken
+                # 更新剩余时间，逐步减少负奖励而非直接给0
+                self.time_remaining[car] -= time_taken
 
                 # 检查是否到达终点
                 end_station = self.get_nearest_stations([self.end_coords[car]])[0]
                 if self.current_positions[car] == end_station:
-                    # 根据到达终点时的剩余时间给予奖励
-                    reward = self.current_energy[car] + (self.time_remaining[car] * 10)  # 奖励根据剩余能量和时间
-                    rewards.append(reward)
                     self.done[car] = True
+                    rewards.append(100 + max(self.time_remaining[car], 0))  # 正向奖励，剩余时间越多奖励越大
                 else:
-                    # 如果超时但未到达终点，给予负奖励
-                    if self.time_remaining[car] <= 0:
-                        rewards.append(-500)  # 超时未完成，给予较大的负奖励
-                        self.done[car] = True
-                    else:
-                        # 正常更新时的奖励为剩余电量
-                        rewards.append(self.current_energy[car])
+                    rewards.append(self.current_energy[car] / 10)  # 每一步都给予正向奖励
 
-                # 如果电量耗尽或超出截止时间，则任务失败
-                if self.current_energy[car] <= 0 or self.time_remaining[car] <= 0:
-                    rewards.append(-500)  # 电量耗尽或时间超时的惩罚
+                # 电量耗尽或超时惩罚
+                if self.current_energy[car] <= 0:
                     self.done[car] = True
+                    rewards.append(-50)  # 电量耗尽，较小负奖励
+
+                if self.time_remaining[car] <= 0:
+                    self.done[car] = True
+                    rewards.append(-25)  # 超时，较小负奖励
+
             else:
                 rewards.append(0)
 
         next_state = self.get_state()
         return next_state, rewards, self.done
-
-    def get_total_remaining_energy(self):
-        # 计算所有到达终点的车辆的剩余电量总和
-        return sum([self.current_energy[i] for i in range(self.n_cars) if self.done[i]])
 
 
 class DQNAgent:
@@ -183,7 +160,7 @@ class DQNAgent:
         )
 
     def remember(self, state, action, reward, next_state, done):
-        # # 确保 reward 是一个标量
+        # 确保 reward 是一个标量
         reward = np.array(reward).mean()  # 可以取平均值或其他方式
         # 存储经验
         self.memory.append((state, action, reward, next_state, done))
