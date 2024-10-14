@@ -79,15 +79,22 @@ class EVDispatchEnvironment:
         return nearest_stations
 
     def get_state(self):
-        # 返回当前状态，包括当前能量、剩余时间和当前位置
-        state = []
+        # 返回当前状态，包括当前能量、剩余时间、当前位置和终点位置
         end_positions = self.get_nearest_stations(self.end_coords)
-        for i in range(self.n_cars):
-            state.extend([self.current_energy[i], self.time_remaining[i],
-                          self.current_positions[i], end_positions[i]])
+        state = np.array([
+            [self.current_energy[i], self.time_remaining[i],
+            self.current_positions[i], end_positions[i]]
+            for i in range(self.n_cars)
+        ], dtype=np.float32)
+        
+        return state
 
-        return np.array(state, dtype=np.float32)
-
+    # 在EVDispatchEnvironment类中添加一个新方法
+    def get_path(self, car_index):
+        path = [self.get_nearest_stations([self.start_coords[car_index]])[0]]
+        path.extend(self.paths[car_index])
+        path.append(self.get_nearest_stations([self.end_coords[car_index]])[0])
+        return path
     def step(self, actions):
         rewards = []
         for car, action in enumerate(actions):
@@ -124,11 +131,15 @@ class EVDispatchEnvironment:
                 # 更新剩余时间
                 self.time_remaining[car] -= time_taken
 
+                
                 # 修改这里：使用更合理的奖励函数
                 end_station = self.get_nearest_stations([self.end_coords[car]])[0]
                 if self.current_positions[car] == end_station:
                     self.done[car] = True
-                    rewards.append(100 + max(self.time_remaining[car], 0) + self.current_energy[car])
+                    if self.time_remaining[car] > 0:
+                        rewards.append(100 + self.time_remaining[car] + self.current_energy[car])
+                    else:
+                        rewards.append(-100)  # 超时惩罚
                 else:
                     rewards.append(-1)  # 每步给予小惩罚，鼓励尽快到达目的地
 
@@ -204,8 +215,8 @@ class ImprovedDQNModel(nn.Module):
 
 
 class DQNAgent:
-    def __init__(self, state_size, action_size, n_cars):
-        self.state_size = state_size
+    def __init__(self, state_size_per_car, action_size, n_cars):
+        self.state_size_per_car=state_size_per_car
         self.action_size = action_size
         self.n_cars = n_cars
         self.memory = deque(maxlen=5000)
@@ -291,11 +302,11 @@ env = EVDispatchEnvironment(distance_matrix, speed_matrix, charge_matrix,
                             energy_consumption, bus_stations_coords,
                             start_coords, end_coords)
 
-state_size = env.n_cars * 4  # 每辆车的状态：当前能量、剩余时间、当前位置、终点位置
+# 每辆车的状态：当前能量、剩余时间、当前位置、终点位置
 action_size = env.n_stations  # 动作空间为所有公交站点
 n_cars = len(initial_energy)
 
-agent = DQNAgent(state_size, action_size, n_cars)
+agent = DQNAgent(state_size_per_car=4,  action_size=action_size, n_cars=n_cars)
 episodes = args.episodes
 batch_size = args.batch_size
 rewards_history = []
@@ -356,7 +367,37 @@ plt.title('Episode Rewards')
 plt.savefig('episode_rewards.jpg')
 plt.close()
 
-# 生成 results.xlsx
+# 在训练循环结束后，加载最佳模型并进行预测
+best_model = ImprovedDQNModel(state_size_per_car=4, action_size=action_size, n_cars=n_cars).to(agent.device)
+best_model.load_state_dict(torch.load('best_dqn_model.pth'))
+best_model.eval()
+
+
+# 在使用最佳模型进行预测时记录路径和状态
+paths = [[] for _ in range(env.n_cars)]
+energy_history = [[] for _ in range(env.n_cars)]
+time_history = [[] for _ in range(env.n_cars)]
+
+state = env.reset()
+done = [False] * env.n_cars
+
+while not all(done):
+    with torch.no_grad():
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(agent.device)
+        actions = best_model(state_tensor).argmax(dim=2).cpu().numpy().squeeze(0)
+    
+    next_state, rewards, done = env.step(actions)
+    
+    # 记录每辆车的路径、能量和时间
+    for i in range(env.n_cars):
+        if not done[i]:
+            paths[i].append(actions[i])
+            energy_history[i].append(env.current_energy[i])
+            time_history[i].append(env.time_remaining[i])
+    
+    state = next_state
+
+# 创建结果工作簿和工作表
 workbook = xlsxwriter.Workbook('results.xlsx')
 summary_sheet = workbook.add_worksheet('汇总')
 detail_sheet = workbook.add_worksheet('调度详情')
@@ -368,39 +409,34 @@ for i in range(env.n_cars):
     if env.done[i]:  # 确保只计算已到达终点的电动汽车
         remaining_energy = env.current_energy[i]
         remaining_time = env.time_remaining[i]
-        total_remaining_energy += remaining_energy  # 仅计算已到达终点车辆的剩余电量
+        total_remaining_energy += remaining_energy
     else:
         remaining_energy = 0
         remaining_time = 0
     summary_sheet.write_row(i + 1, 0, [i, remaining_energy, remaining_time])
 
-# 在最后一行记录已到达目标地点电动汽车剩余电量总和
 summary_sheet.write_row(env.n_cars + 1, 0, ['总和', total_remaining_energy, ''])
 
 # 调度详情工作表
-# 第1行记录电动汽车初始化信息
-detail_sheet.write_row(
-    'A1', ['电动汽车序号', '起点序号', '终点序号', '初始电量', '电池容量', '截止时间'])
+detail_sheet.write_row('A1', ['电动汽车序号', '起点序号', '终点序号', '初始电量', '电池容量', '截止时间'])
 for i in range(env.n_cars):
-    start_station = env.current_positions[i]
+    start_station = env.get_nearest_stations([env.start_coords[i]])[0]
     end_station = env.get_nearest_stations([env.end_coords[i]])[0]
     detail_sheet.write_row(i + 1, 0, [i, start_station, end_station, initial_energy[i],
                                       battery_capacity[i], deadlines[i]])
 
-# 从第2行开始记录每辆车的调度路径和状态
+# 在写入Excel文件时修改路径记录
 row = env.n_cars + 2
 for i in range(env.n_cars):
+    complete_path = env.get_path(i)
     detail_sheet.write(row, 0, f'电动汽车 {i} 调度路径')
-    detail_sheet.write_row(row, 1, env.paths[i])
+    detail_sheet.write_row(row, 1, complete_path)
     row += 1
-    detail_sheet.write(row, 0, f'电动汽车 {i} 剩余电量和时间')
-    energies = []  # 记录每一步的剩余电量
-    times = []  # 记录每一步的剩余时间
-    for _ in env.paths[i]:
-        energies.append(env.current_energy[i])
-        times.append(env.time_remaining[i])
-    detail_sheet.write_row(row, 1, energies)
-    detail_sheet.write_row(row + 1, 1, times)
+    detail_sheet.write(row, 0, f'电动汽车 {i} 剩余电量')
+    detail_sheet.write_row(row, 1, energy_history[i])
+    row += 1
+    detail_sheet.write(row, 0, f'电动汽车 {i} 剩余时间')
+    detail_sheet.write_row(row, 1, time_history[i])
     row += 2
 
 workbook.close()
